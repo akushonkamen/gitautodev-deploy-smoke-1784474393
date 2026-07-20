@@ -1,0 +1,416 @@
+# Composite action: Module 2 (triage reply)
+# PRD §2 module 2. See docs/composite-action-spec.md for the full interface.
+#
+# Engine-agnostic wrapper (PRD §4). With engine=claude it uses
+# anthropics/claude-code-action@v1; with engine=codex it uses openai/codex-action@v1.
+#
+# claude-code-action@v1 API used here:
+#   - prompt, settings (JSON), anthropic_api_key, github_token
+#   - Output: steps.<id>.outputs.execution_file (JSON with Claude's text result)
+#
+# GLM (Zhipu AI) passthrough: when `anthropic-base-url` input is non-empty, the
+# claude branch injects it as ANTHROPIC_BASE_URL env on the action step.
+# claude-code CLI honors that env var, so requests route to the Zhipu
+# Anthropic-compatible endpoint without forking the action.
+#
+# Output protocol (PR #133 follow-up):
+#   - GLM passthrough does not honor --json-schema strict mode AND does not
+#     reliably invoke the Bash tool to self-post comments (num_turns=1,
+#     is_error=true, zero tool calls observed). We therefore:
+#       1. Ask Claude to output a single JSON line as plain text (no tool use).
+#       2. Read the assistant text from execution_file after the step ends.
+#       3. Parse it tolerantly (extract.sh handles pure JSON / fenced JSON /
+#          substring JSON / hidden block — same strategies as before).
+#       4. Post the comment ourselves via `gh issue comment` in a dedicated
+#          bash step.
+#
+# REQUIRED PERMISSIONS (calling workflow must grant):
+#   contents: read       (read CLAUDE.md, prompts)
+#   issues:   write      (post triage comment + apply label) — PRD §7 S1
+#
+# This action POSTS the triage comment on the issue and emits its URL as
+# `audit-comment-url`. The caller still decides whether to apply labels.
+
+name: "Module 2 — Triage reply"
+description: "First-response, dedupe, clarification, routing label for newly opened Issue (PRD §2 module 2)."
+
+inputs:
+  issue-number:
+    description: "Issue number to triage"
+    required: true
+  repo-token:
+    description: "GITHUB_TOKEN with issues:write"
+    required: true
+  api-key:
+    description: "Engine provider API key (LLM_API_KEY for GLM passthrough)"
+    required: true
+  api-key-backup:
+    description: "Backup API key for 429 quota-exhaustion fallback (LLM_API_KEY_BACKUP). Empty disables retry."
+    required: false
+    default: ""
+  anthropic-base-url:
+    description: "Anthropic-compatible API base URL (e.g. https://open.bigmodel.cn/api/anthropic for GLM). Empty = Anthropic default."
+    required: false
+    default: ""
+  engine:
+    description: "LLM engine (claude | codex)"
+    required: false
+    default: "claude"
+  model:
+    description: "Model ID override. Empty = engine default (or whatever GLM proxy serves)."
+    required: false
+    default: ""
+  max-turns:
+    description: "Agent turn cap"
+    required: false
+    default: "6"
+  context-budget-paths:
+    description: "Space-sep path allowlist (currently advisory; not enforced by action)"
+    required: false
+    default: ""
+  dry-run:
+    description: "If true, do not apply labels (comment posting is caller's responsibility)"
+    required: false
+    default: "false"
+
+outputs:
+  stage:
+    description: "Lifecycle stage reached (triage)"
+    value: ${{ steps.emit.outputs.stage }}
+  audit-comment-url:
+    description: "URL of the audit comment (empty — comment is posted by the caller workflow)"
+    value: ${{ steps.emit.outputs.audit-comment-url }}
+  decision:
+    description: "reply | work"
+    value: ${{ steps.parse.outputs.decision }}
+  comment_body:
+    description: "Body of the comment to post on the issue (multi-line markdown)"
+    value: ${{ steps.parse.outputs.comment_body }}
+  suggested_labels:
+    description: "Comma-sep suggested labels"
+    value: ${{ steps.parse.outputs.suggested_labels }}
+  confidence:
+    description: "float [0,1] — claude's confidence in the decision"
+    value: ${{ steps.parse.outputs.confidence }}
+  workload_class:
+    description: "M3/M8 (pipeline-redesign-v3): trivial | standard | complex. Defaults to 'standard' if engine omits. M8 wires this into triage-issue.yml routing — trivial/standard auto-apply accepted-by-claude (S2 amendment), complex routes to clarify loop."
+    value: ${{ steps.parse.outputs.workload_class }}
+
+runs:
+  using: composite
+  steps:
+    # Fetch issue title/body/labels and inject into the prompt. Claude can't
+    # fetch issues itself (no Bash/Network in the allow-list), so we provide
+    # the body as context.
+    - name: Fetch issue context
+      id: issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.repo-token }}
+        NUMBER: ${{ inputs.issue-number }}
+      run: |
+        set -eu
+        json=$(gh issue view "$NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body,labels,url)
+        title=$(printf '%s' "$json" | jq -r '.title')
+        url=$(printf '%s' "$json"   | jq -r '.url')
+        body=$(printf '%s' "$json"  | jq -r '.body // "(empty)"')
+        labels=$(printf '%s' "$json" | jq -r '.labels | map(.name) | join(", ")')
+        if [ -z "$labels" ]; then labels="(none)"; fi
+
+        # Multi-line values via heredoc delimiters
+        {
+          echo "title<<TITLE_EOF"
+          printf '%s\n' "$title"
+          echo "TITLE_EOF"
+          echo "url=$url"
+          echo "labels=$labels"
+          echo "body<<BODY_EOF"
+          printf '%s\n' "$body"
+          echo "BODY_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    # Build settings JSON (model only included if non-empty).
+    # Follow-up to PR #132: Claude no longer posts its own comment. GLM
+    # passthrough emits num_turns=1 / is_error=true without ever invoking
+    # the Bash tool, so self-posting is unreliable. The workflow now reads
+    # Claude's text response from execution_file and posts the comment in
+    # a dedicated bash step below.
+    - name: Build claude config
+      id: cfg
+      shell: bash
+      env:
+        MODEL_INPUT: ${{ inputs.model }}
+        MAX_TURNS: ${{ inputs.max-turns }}
+      run: |
+        set -eu
+        # settings JSON: permissions + maxTurns; model only if non-empty.
+        # No Bash allow-list entry — Claude reads CLAUDE.md only, outputs text.
+        if [ -n "$MODEL_INPUT" ]; then
+          settings=$(jq -c -n \
+            --arg m "$MODEL_INPUT" \
+            --argjson t "$MAX_TURNS" \
+            '{permissions:{allow:["Read","Grep","Glob"],deny:["Write","Edit","Bash","WebFetch"]}, maxTurns:$t, model:$m}')
+        else
+          settings=$(jq -c -n \
+            --argjson t "$MAX_TURNS" \
+            '{permissions:{allow:["Read","Grep","Glob"],deny:["Write","Edit","Bash","WebFetch"]}, maxTurns:$t}')
+        fi
+        {
+          echo "settings<<SETTINGS_EOF"
+          echo "$settings"
+          echo "SETTINGS_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Triage via Claude (or GLM via base-url passthrough)
+      if: inputs.engine == 'claude'
+      id: claude-run
+      continue-on-error: true
+      uses: anthropics/claude-code-action@v1
+      env:
+        # Empty string → env unset → claude-code CLI uses Anthropic default.
+        # Non-empty → CLI routes to the given Anthropic-compatible endpoint.
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+      with:
+        anthropic_api_key: ${{ inputs.api-key }}
+        github_token: ${{ inputs.repo-token }}
+        prompt: |
+          You are the triage module of the GithubAutoDev pipeline.
+          A new Issue was just opened.
+
+          Title: ${{ steps.issue.outputs.title }}
+          URL: ${{ steps.issue.outputs.url }}
+          Issue number: ${{ inputs.issue-number }}
+          Existing labels: ${{ steps.issue.outputs.labels }}
+
+          Issue body:
+          ```
+          ${{ steps.issue.outputs.body }}
+          ```
+
+          Read CLAUDE.md for project context ONLY if the issue references
+          directories you need to inspect; otherwise skip. Do NOT scan the
+          whole repo. Do NOT call any tools — output text only.
+
+          Decide ONE of:
+            - "reply": the issue needs clarification, is a duplicate, is out of
+              scope, or is a user-error. Your comment_body should ask the question
+              or explain the resolution.
+            - "work":  the issue is a legitimate feature/bug that should enter the
+              development pipeline. Your comment_body should be a brief
+              acknowledgement + summary of what you understood the ask to be.
+
+          Never print tokens, API keys, or environment variable values (PRD §7 S4).
+
+          ## Output protocol (mandatory)
+
+          Output ONLY a single JSON object on ONE line. No prose around it,
+          no markdown fences, no hidden HTML comments. The downstream parser
+          tolerates accidental wrapping but you should aim for one line.
+
+          Schema:
+          {"decision":"<reply|work>","comment_body":"<markdown for the user-facing reply, >= 10 chars>","suggested_labels":[<array of label-name strings, empty [] if none>],"confidence":<float 0.0-1.0>,"workload_class":"<trivial|standard|complex>"}
+
+          Field rules:
+          - decision: exactly "reply" or "work"
+          - comment_body: >= 10 chars, plain text or markdown, will be posted
+            verbatim as the issue comment
+          - suggested_labels: JSON array of EXISTING label name strings from
+            the project's labels.yml (empty [] if none); do not invent labels
+          - confidence: float in [0, 1]
+          - workload_class: "trivial" (low-risk, single-file, clear AC),
+            "standard" (one module, clear AC), or "complex" (cross-module,
+            ambiguous AC)
+          - No trailing commas, no JSON comments, no surrounding text
+
+          Respond with the JSON object only.
+        settings: ${{ steps.cfg.outputs.settings }}
+
+    - name: Triage via Codex
+      if: inputs.engine == 'codex'
+      id: codex-run
+      continue-on-error: true
+      uses: openai/codex-action@v1
+      with:
+        openai_api_key: ${{ inputs.api-key }}
+        github_token: ${{ inputs.repo-token }}
+        prompt: |
+          You are the triage module. Triage Issue #${{ inputs.issue-number }} per CLAUDE.md.
+          Output JSON: { decision: "reply"|"work", comment_body, suggested_labels, confidence }.
+          Never print secrets.
+
+    # Follow-up to PR #132: GLM passthrough never invokes the Bash tool to
+    # post its own comment, so we read the assistant text from execution_file
+    # (claude-code-action exposes it as an output). The parser is tolerant —
+    # it handles hidden blocks, fenced JSON, substring JSON, or pure JSON.
+    # If parsing fails, extract.sh falls back to decision=reply + a
+    # clarification ask, so the workflow never hard-fails here.
+    - name: Detect 429 quota exhaustion (primary key)
+      id: detect-429
+      if: always()
+      shell: bash
+      env:
+        EXEC_FILE: ${{ steps.claude-run.outputs.execution_file }}
+      run: |
+        set -uo pipefail
+        needs_retry="false"
+        if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
+          if grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' "$EXEC_FILE" 2>/dev/null \
+             && grep -q '429' "$EXEC_FILE" 2>/dev/null; then
+            needs_retry="true"
+            echo "::notice::Primary LLM key hit 429 quota — retrying with backup key."
+          fi
+        fi
+        echo "needs-retry=$needs_retry" >> "$GITHUB_OUTPUT"
+
+    - name: Triage via Claude (backup key — primary hit 429)
+      if: steps.detect-429.outputs.needs-retry == 'true' && inputs.api-key-backup != ''
+      id: claude-run-backup
+      continue-on-error: true
+      uses: anthropics/claude-code-action@v1
+      env:
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+      with:
+        anthropic_api_key: ${{ inputs.api-key-backup }}
+        github_token: ${{ inputs.repo-token }}
+        prompt: |
+          You are the triage module of the GithubAutoDev pipeline.
+          A new Issue was just opened.
+
+          Title: ${{ steps.issue.outputs.title }}
+          URL: ${{ steps.issue.outputs.url }}
+          Issue number: ${{ inputs.issue-number }}
+          Existing labels: ${{ steps.issue.outputs.labels }}
+
+          Issue body:
+          ```
+          ${{ steps.issue.outputs.body }}
+          ```
+
+          Read CLAUDE.md for project context ONLY if the issue references
+          directories you need to inspect; otherwise skip. Do NOT scan the
+          whole repo. Do NOT call any tools — output text only.
+
+          Decide ONE of:
+            - "reply": the issue needs clarification, is a duplicate, is out of
+              scope, or is a user-error. Your comment_body should ask the question
+              or explain the resolution.
+            - "work":  the issue is a legitimate feature/bug that should enter the
+              development pipeline. Your comment_body should be a brief
+              acknowledgement + summary of what you understood the ask to be.
+
+          Never print tokens, API keys, or environment variable values (PRD §7 S4).
+
+          ## Output protocol (mandatory)
+
+          Output ONLY a single JSON object on ONE line. No prose around it,
+          no markdown fences, no hidden HTML comments. The downstream parser
+          tolerates accidental wrapping but you should aim for one line.
+
+          Schema:
+          {"decision":"<reply|work>","comment_body":"<markdown for the user-facing reply, >= 10 chars>","suggested_labels":[<array of label-name strings, empty [] if none>],"confidence":<float 0.0-1.0>,"workload_class":"<trivial|standard|complex>"}
+
+          Field rules:
+          - decision: exactly "reply" or "work"
+          - comment_body: >= 10 chars, plain text or markdown, will be posted
+            verbatim as the issue comment
+          - suggested_labels: JSON array of EXISTING label name strings from
+            the project's labels.yml (empty [] if none); do not invent labels
+          - confidence: float in [0, 1]
+          - workload_class: "trivial" (low-risk, single-file, clear AC),
+            "standard" (one module, clear AC), or "complex" (cross-module,
+            ambiguous AC)
+          - No trailing commas, no JSON comments, no surrounding text
+
+          Respond with the JSON object only.
+        settings: ${{ steps.cfg.outputs.settings }}
+
+    - name: Parse engine output
+      id: parse
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.repo-token }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+        EXEC_FILE: ${{ steps.claude-run-backup.outputs.execution_file || steps.claude-run.outputs.execution_file }}
+      run: |
+        set -euo pipefail
+        if [ -z "$EXEC_FILE" ] || [ ! -f "$EXEC_FILE" ]; then
+          echo "::error::execution_file missing (Claude step may have failed before producing output)."
+          echo "::error::Check the Run triage step logs for SDK errors."
+          exit 1
+        fi
+        # claude-execution-output.json is a JSON ARRAY of transcript events
+        # (system/init, assistant turns, then a final {type:"result",result:"<text>"}
+        # entry). Older SDK builds emit a single object instead — handle both.
+        raw=$(jq -r '
+          if type == "array" then
+            ( [ .[] | select(.type == "result" and (.result | type == "string") and (.result | length > 0)) | .result ] | last // "" )
+          else
+            ( .result // "" )
+          end
+        ' "$EXEC_FILE" 2>/dev/null || echo "")
+        # If result extraction failed, fall back to last assistant message text.
+        if [ -z "$raw" ]; then
+          raw=$(jq -r '
+            if type == "array" then
+              ( [ .[] | select(.type == "assistant")
+                     | ((.message.content // []) | map(select(.type == "text") | .text) | join("\n")) ]
+                | map(select(length > 0)) | last // "" )
+            else "" end
+          ' "$EXEC_FILE" 2>/dev/null || echo "")
+        fi
+        if [ -z "$raw" ]; then
+          echo "::error::Could not extract assistant text from execution_file."
+          echo "::error::File contents (first 500 chars):"
+          head -c 500 "$EXEC_FILE" | sed 's/^/  raw> /' || true
+          exit 1
+        fi
+        export STRUCTURED="$raw"
+        # Diagnostic: dump Claude's raw text so we can see why extract.sh
+        # fails to find JSON. Bounded markers + head -c 3000 so logs stay
+        # readable. Remove once prompt output is reliable.
+        echo "===== CLAUDE_RAW_START ====="
+        printf '%s' "$raw" | head -c 3000
+        echo ""
+        echo "===== CLAUDE_RAW_END ====="
+        ./.github/actions/triage/extract.sh
+
+    # Post the triage comment ourselves — Claude no longer self-posts.
+    # PR-133 follow-up: GLM passthrough tool-use is unreliable, so the
+    # workflow owns the gh issue comment call.
+    - name: Post triage comment
+      id: post-comment
+      if: always() && steps.parse.outputs.decision != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.repo-token }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+        COMMENT_BODY: ${{ steps.parse.outputs.comment_body }}
+      run: |
+        set -euo pipefail
+        if [ -z "$COMMENT_BODY" ]; then
+          echo "::warning::comment_body empty — skipping post."
+          exit 0
+        fi
+        url=$(gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+          --body "$COMMENT_BODY" 2>/dev/null || echo "")
+        if [ -n "$url" ]; then
+          echo "comment-url=$url" >> "$GITHUB_OUTPUT"
+          echo "Posted triage comment: $url"
+        else
+          echo "::warning::gh issue comment returned no URL (token scope or rate limit?)."
+        fi
+
+    - name: Emit common outputs
+      id: emit
+      shell: bash
+      env:
+        DECISION: ${{ steps.parse.outputs.decision }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        COMMENT_URL: ${{ steps.post-comment.outputs.comment-url }}
+      run: |
+        echo "stage=triage" >> "$GITHUB_OUTPUT"
+        echo "audit-comment-url=$COMMENT_URL" >> "$GITHUB_OUTPUT"
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "Dry-run: skipping label application (comment posting is caller's job)"
+        fi
