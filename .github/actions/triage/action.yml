@@ -173,6 +173,10 @@ runs:
       with:
         anthropic_api_key: ${{ inputs.api-key }}
         github_token: ${{ inputs.repo-token }}
+        # Triage fires on issues.opened. Issues created via the App
+        # installation token (e.g. smoke test, future bot-driven flows)
+        # have actor=gitautodev[bot]; allow explicitly so the action runs.
+        allowed_bots: "gitautodev[bot],akushonkamen[bot]"
         prompt: |
           You are the triage module of the GithubAutoDev pipeline.
           A new Issue was just opened.
