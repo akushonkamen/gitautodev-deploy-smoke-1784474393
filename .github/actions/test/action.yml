@@ -1,0 +1,379 @@
+# Composite action: Module 6 (test, v2)
+# Originally PRD §4 specified Codex as out-of-distribution tester. Amended to a
+# second isolated Claude Code process with tool-restricted reviewer profile
+# (see docs/architecture.md §"Module 6 engine amendment"). Reason: maintainers
+# cannot configure OPENAI_API_KEY (cost / account constraints); LLM_API_KEY
+# already configured with GLM passthrough. Strict OOD value is reduced but
+# retained partially via model tier separation + tool whitelist + prompt framing.
+#
+# SECURITY: triggered by `verified` label (Module 5 passed). The second Claude
+# process runs with allow: Read/Grep/Glob/Bash and deny: Write/Edit. Bash is
+# permitted so the tester can actually run the existing test suite (npm test,
+# pytest, cargo test). It MUST NOT modify any files (no test generation in v2).
+#
+# REQUIRED PERMISSIONS (caller workflow must grant):
+#   contents:        read        (read PR diff + test files)
+#   issues:          write       (post audit comment, apply labels)
+#   pull-requests:   write       (post test report comment on PR)
+#
+# S1: NO contents:write. Test reads source + runs test commands but does not
+# write any files (allow list + deny list enforce this at the action level).
+# S5: claude-code-action with explicit tool allow/deny list. No --dangerously-skip-permissions.
+
+name: "Module 6 — Test (v2)"
+description: "Run existing tests via a second isolated Claude Code process (tool-restricted reviewer), emit test report + label transition."
+
+inputs:
+  issue-number:
+    description: "Issue number"
+    required: true
+  pr-url:
+    description: "PR URL for audit comment traceability"
+    required: true
+  pr-number:
+    description: "PR number for posting test report comment"
+    required: true
+  head-branch:
+    description: "claude/issue-N-* branch to test"
+    required: true
+  base-branch:
+    description: "Base branch (dev)"
+    required: true
+  repo-token:
+    description: "GITHUB_TOKEN (read-only + PR comment + label)"
+    required: true
+  api-key:
+    description: "Anthropic-compatible API key (LLM_API_KEY for GLM passthrough)"
+    required: true
+  api-key-backup:
+    description: "Backup API key for 429 quota-exhaustion fallback (LLM_API_KEY_BACKUP). Empty disables retry."
+    required: false
+    default: ""
+  anthropic-base-url:
+    description: "Anthropic-compatible API base URL. Empty = Anthropic default. Set for GLM passthrough."
+    required: false
+    default: ""
+  engine:
+    description: "LLM engine. Default: claude (v2 amendment — Codex removed for cost reasons)"
+    required: false
+    default: "claude"
+  model:
+    description: "Model ID override. Empty = engine default (recommend Opus tier for thorough review)."
+    required: false
+    default: ""
+  max-turns:
+    description: "Agent turn cap (PRD §5). Default: 10"
+    required: false
+    default: "10"
+  context-budget-paths:
+    description: "Path allowlist — limit reads (PRD §5)"
+    required: false
+    default: ""
+
+outputs:
+  test-status:
+    description: "Test result (passed | failed)"
+    value: ${{ steps.emit.outputs.test-status }}
+  test-report:
+    description: "Maintainer-readable test report (max 2000 chars)"
+    value: ${{ steps.emit.outputs.test-report }}
+  commit-sha:
+    description: "Head commit SHA that was tested"
+    value: ${{ steps.emit.outputs.commit-sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch issue context + PR diff
+      id: context
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.repo-token }}
+        NUMBER: ${{ inputs.issue-number }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+      run: |
+        set -eu
+        # Fetch issue title, body, labels
+        json=$(gh issue view "$NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body,url)
+        title=$(printf '%s' "$json" | jq -r '.title')
+        body=$(printf '%s' "$json"  | jq -r '.body // "(empty)"')
+        url=$(printf '%s' "$json"   | jq -r '.url')
+        {
+          echo "title<<TITLE_EOF"
+          printf '%s\n' "$title"
+          echo "TITLE_EOF"
+          echo "url=$url"
+          echo "body<<BODY_EOF"
+          printf '%s\n' "$body"
+          echo "BODY_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        # Fetch PR diff (first 8000 lines — cap for context budget)
+        diff=$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" 2>/dev/null | head -n 8000 || echo "(diff unavailable)")
+        {
+          echo "diff<<DIFF_EOF"
+          printf '%s\n' "$diff"
+          echo "DIFF_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Build Claude config (settings + sealed schema + allowed/disallowed)
+      id: cfg
+      shell: bash
+      env:
+        MODEL_INPUT: ${{ inputs.model }}
+        MAX_TURNS: ${{ inputs.max-turns }}
+        CONTEXT_PATHS: ${{ inputs.context-budget-paths }}
+      run: |
+        set -eu
+        # S5: tool profile for tester role.
+        # allow: Read/Grep/Glob/Bash — Bash so tester can run test commands.
+        # deny:  Write/Edit          — tester cannot modify any file.
+        if [ -n "$MODEL_INPUT" ]; then
+          settings=$(jq -c -n \
+            --arg m "$MODEL_INPUT" \
+            --argjson t "$MAX_TURNS" \
+            '{permissions:{allow:["Read","Grep","Glob","Bash"],deny:["Write","Edit"]}, maxTurns:$t, model:$m}')
+        else
+          settings=$(jq -c -n \
+            --argjson t "$MAX_TURNS" \
+            '{permissions:{allow:["Read","Grep","Glob","Bash"],deny:["Write","Edit"]}, maxTurns:$t}')
+        fi
+        {
+          echo "settings<<SETTINGS_EOF"
+          echo "$settings"
+          echo "SETTINGS_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        # Sealed JSON output schema — matches prompt contract.
+        # test_status: "passed" | "failed"
+        # test_report: maintainer-readable, max 2000 chars
+        # failures: list of specific tests that didn't pass (empty if passed)
+        # coverage_gaps: list of acceptance criteria not covered by existing tests
+        schema=$(jq -c . <<'JSON'
+        {
+          "type": "object",
+          "required": ["test_status", "test_report", "failures", "coverage_gaps"],
+          "properties": {
+            "test_status": {"type": "string", "enum": ["passed", "failed"]},
+            "test_report": {"type": "string", "maxLength": 2000},
+            "failures": {"type": "array", "items": {"type": "string"}},
+            "coverage_gaps": {"type": "array", "items": {"type": "string"}}
+          },
+          "additionalProperties": false
+        }
+        JSON
+        )
+        echo "schema='${schema}'" >> "$GITHUB_OUTPUT"
+
+        # Disallowed tools string (extra guard beyond settings.deny).
+        # Block git push / commit / branch ops so the tester cannot mutate git state.
+        disallowed="Write,Edit,Bash(git push*),Bash(git commit*),Bash(git checkout*),Bash(git reset*),Bash(git rebase*)"
+        echo "disallowed=${disallowed}" >> "$GITHUB_OUTPUT"
+
+        if [ -n "$CONTEXT_PATHS" ]; then
+          echo "context_paths=$CONTEXT_PATHS" >> "$GITHUB_OUTPUT"
+        else
+          echo "context_paths=" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Run tests via Claude (second isolated process, tool-restricted tester)
+      id: claude-run
+      continue-on-error: true
+      uses: anthropics/claude-code-action@v1
+      env:
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+      with:
+        anthropic_api_key: ${{ inputs.api-key }}
+        github_token: ${{ inputs.repo-token }}
+        prompt: |
+          You are the TEST module of the GithubAutoDev pipeline (Module 6, v2).
+          You are a second, isolated Claude Code process — your job is to act as
+          an independent tester reviewing the work that the develop module (Module 4)
+          shipped. You did NOT write this code.
+
+          Issue #${{ inputs.issue-number }}: ${{ steps.context.outputs.title }}
+          URL: ${{ steps.context.outputs.url }}
+
+          ## Issue body (acceptance criteria source)
+          ```
+          ${{ steps.context.outputs.body }}
+          ```
+
+          ## PR diff (implementation to test)
+          ```diff
+          ${{ steps.context.outputs.diff }}
+          ```
+
+          ## Task
+          1. Detect the project's test framework by reading the repo (package.json,
+             pyproject.toml, Cargo.toml, go.mod, etc.).
+          2. Run the existing test suite via Bash (e.g. `npm test`, `pytest`,
+             `cargo test`, `go test ./...`). Capture pass/fail per test.
+          3. For each acceptance criterion in the issue body, decide whether the
+             existing tests cover it. If NOT covered, list it in `coverage_gaps`.
+          4. Do NOT write or modify any file (S5: Write/Edit denied). If you believe
+             a new test file is needed, describe it in `coverage_gaps` instead.
+          5. Never print tokens, API keys, or environment variable values (S4).
+
+          ## Decision rule
+          - `test_status` = "passed" if existing tests run cleanly AND every
+            acceptance criterion is covered by at least one test.
+          - `test_status` = "failed" if any existing test fails OR a critical
+            acceptance criterion has zero test coverage.
+
+          ## Output ONE JSON object (sealed schema):
+          {
+            "test_status": "passed" | "failed",
+            "test_report": "<maintainer-readable report, max 2000 chars>",
+            "failures": ["<specific test that failed>", ...],
+            "coverage_gaps": ["<acceptance criterion not covered by existing tests>", ...]
+          }
+
+          Rules:
+          - `test_report`: structured summary — list each test run with ✓/✗, then
+            list each acceptance criterion with ✓/✗ coverage.
+          - `failures`: empty if all existing tests pass.
+          - `coverage_gaps`: empty if every acceptance criterion is covered.
+          - Match the natural language of the issue body in the test_report.
+          ${{ steps.cfg.outputs.context_paths && format('Allowed paths: {0}', steps.cfg.outputs.context_paths) || '' }}
+
+          Respond ONLY with the JSON object. No prose, no markdown fences.
+        settings: ${{ steps.cfg.outputs.settings }}
+        claude_args: "--json-schema ${{ steps.cfg.outputs.schema }} --disallowedTools '${{ steps.cfg.outputs.disallowed }}'"
+
+    - name: Detect 429 quota exhaustion (primary key)
+      id: detect-429
+      if: always()
+      shell: bash
+      env:
+        EXEC_FILE: ${{ steps.claude-run.outputs.execution_file }}
+      run: |
+        set -uo pipefail
+        needs_retry="false"
+        if [ -n "$EXEC_FILE" ] && [ -f "$EXEC_FILE" ]; then
+          if grep -qE '"is_error"[[:space:]]*:[[:space:]]*true' "$EXEC_FILE" 2>/dev/null \
+             && grep -q '429' "$EXEC_FILE" 2>/dev/null; then
+            needs_retry="true"
+            echo "::notice::Primary LLM key hit 429 quota — retrying with backup key."
+          fi
+        fi
+        echo "needs-retry=$needs_retry" >> "$GITHUB_OUTPUT"
+
+    - name: Run tests via Claude (backup key — primary hit 429)
+      if: steps.detect-429.outputs.needs-retry == 'true' && inputs.api-key-backup != ''
+      id: claude-run-backup
+      continue-on-error: true
+      uses: anthropics/claude-code-action@v1
+      env:
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+      with:
+        anthropic_api_key: ${{ inputs.api-key-backup }}
+        github_token: ${{ inputs.repo-token }}
+        prompt: |
+          You are the TEST module of the GithubAutoDev pipeline (Module 6, v2).
+          You are a second, isolated Claude Code process — your job is to act as
+          an independent tester reviewing the work that the develop module (Module 4)
+          shipped. You did NOT write this code.
+
+          Issue #${{ inputs.issue-number }}: ${{ steps.context.outputs.title }}
+          URL: ${{ steps.context.outputs.url }}
+
+          ## Issue body (acceptance criteria source)
+          ```
+          ${{ steps.context.outputs.body }}
+          ```
+
+          ## PR diff (implementation to test)
+          ```diff
+          ${{ steps.context.outputs.diff }}
+          ```
+
+          ## Task
+          1. Detect the project's test framework by reading the repo (package.json,
+             pyproject.toml, Cargo.toml, go.mod, etc.).
+          2. Run the existing test suite via Bash (e.g. `npm test`, `pytest`,
+             `cargo test`, `go test ./...`). Capture pass/fail per test.
+          3. For each acceptance criterion in the issue body, decide whether the
+             existing tests cover it. If NOT covered, list it in `coverage_gaps`.
+          4. Do NOT write or modify any file (S5: Write/Edit denied). If you believe
+             a new test file is needed, describe it in `coverage_gaps` instead.
+          5. Never print tokens, API keys, or environment variable values (S4).
+
+          ## Decision rule
+          - `test_status` = "passed" if existing tests run cleanly AND every
+            acceptance criterion is covered by at least one test.
+          - `test_status` = "failed" if any existing test fails OR a critical
+            acceptance criterion has zero test coverage.
+
+          ## Output ONE JSON object (sealed schema):
+          {
+            "test_status": "passed" | "failed",
+            "test_report": "<maintainer-readable report, max 2000 chars>",
+            "failures": ["<specific test that failed>", ...],
+            "coverage_gaps": ["<acceptance criterion not covered by existing tests>", ...]
+          }
+
+          Rules:
+          - `test_report`: structured summary — list each test run with ✓/✗, then
+            list each acceptance criterion with ✓/✗ coverage.
+          - `failures`: empty if all existing tests pass.
+          - `coverage_gaps`: empty if every acceptance criterion is covered.
+          - Match the natural language of the issue body in the test_report.
+          ${{ steps.cfg.outputs.context_paths && format('Allowed paths: {0}', steps.cfg.outputs.context_paths) || '' }}
+
+          Respond ONLY with the JSON object. No prose, no markdown fences.
+        settings: ${{ steps.cfg.outputs.settings }}
+        claude_args: "--json-schema ${{ steps.cfg.outputs.schema }} --disallowedTools '${{ steps.cfg.outputs.disallowed }}'"
+
+    - name: Parse engine output
+      id: emit
+      shell: bash
+      env:
+        STRUCTURED: ${{ steps.claude-run-backup.outputs.structured_output || steps.claude-run.outputs.structured_output }}
+      run: |
+        set -euo pipefail
+        sha=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+        raw="${STRUCTURED:-}"
+
+        if [ -z "$raw" ]; then
+          echo "::warning::structured_output is empty — engine may have failed or timed out."
+          {
+            echo "test-status=failed"
+            echo "test-report=(engine did not emit structured output; inspect run logs)"
+            echo "commit-sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Validate against sealed schema
+        if ! printf '%s' "$raw" | jq -e '
+          (.test_status == "passed" or .test_status == "failed")
+          and (.test_report | type == "string" and length <= 2000)
+          and (.failures | type == "array")
+          and (.coverage_gaps | type == "array")
+        ' >/dev/null 2>&1; then
+          echo "::error::Engine output did not match the {test_status, test_report, failures, coverage_gaps} schema."
+          echo "Raw output (first 500 chars):"
+          printf '%s' "$raw" | head -c 500 | sed 's/^/  raw> /'
+          {
+            echo "test-status=failed"
+            echo "test-report=(engine output schema mismatch; inspect run logs)"
+            echo "commit-sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        test_status="$(printf '%s' "$raw" | jq -r '.test_status')"
+        test_report="$(printf '%s' "$raw" | jq -r '.test_report')"
+        failures="$(printf '%s' "$raw" | jq -c '.failures // []')"
+        coverage_gaps="$(printf '%s' "$raw" | jq -c '.coverage_gaps // []')"
+
+        echo "test-status=$test_status" >> "$GITHUB_OUTPUT"
+        echo "commit-sha=$sha" >> "$GITHUB_OUTPUT"
+        echo "failures=${failures}" >> "$GITHUB_OUTPUT"
+        echo "coverage-gaps=${coverage_gaps}" >> "$GITHUB_OUTPUT"
+        {
+          echo "test-report<<TEST_REPORT_EOF"
+          printf '%s\n' "$test_report"
+          echo "TEST_REPORT_EOF"
+        } >> "$GITHUB_OUTPUT"
