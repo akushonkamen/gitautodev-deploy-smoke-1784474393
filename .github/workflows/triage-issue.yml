@@ -62,7 +62,7 @@ jobs:
       confidence: ${{ steps.triage.outputs.confidence }}
       workload-class: ${{ steps.triage.outputs.workload_class }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
